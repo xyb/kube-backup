@@ -7,6 +7,11 @@ fi
 RESOURCETYPES="${RESOURCETYPES:-"ingress deployment configmap svc rc ds networkpolicy statefulset cronjob pvc"}"
 GLOBALRESOURCES="${GLOBALRESOURCES:-"namespace storageclass clusterrole clusterrolebinding customresourcedefinition"}"
 
+# Exclude noisy self-generated Jobs from being exported.
+# Use a kubectl label selector expression. Example: 'app!=kube-backup' or 'cronjob-name!=kube-state-backup'.
+# NOTE: "!=" also matches objects without that label key, which is usually what we want.
+EXCLUDE_JOB_LABEL_SELECTOR="${EXCLUDE_JOB_LABEL_SELECTOR:-app!=kube-backup}"
+
 # Initialize git repo
 [ -z "$DRY_RUN" ] && [ -z "$GIT_REPO" ] && echo "Need to define GIT_REPO environment variable" && exit 1
 GIT_REPO_PATH="${GIT_REPO_PATH:-"/backup/git"}"
@@ -59,11 +64,13 @@ for resource in $GLOBALRESOURCES; do
         'del(
           .items[].metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
           .items[].metadata.annotations."control-plane.alpha.kubernetes.io/leader",
+          .items[].metadata.managedFields,
           .items[].metadata.uid,
           .items[].metadata.selfLink,
           .items[].metadata.resourceVersion,
           .items[].metadata.creationTimestamp,
-          .items[].metadata.generation
+          .items[].metadata.generation,
+          .items[].metadata.ownerReferences[]?.uid
       )' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml"
 done
 
@@ -76,6 +83,9 @@ for namespace in $NAMESPACES; do
         label_selector=""
         if [[ "$type" == 'configmap' && -z "${INCLUDE_TILLER_CONFIGMAPS:-}" ]]; then
             label_selector="-l OWNER!=TILLER"
+        fi
+        if [[ "$type" == 'job' && -n "${EXCLUDE_JOB_LABEL_SELECTOR:-}" ]]; then
+            label_selector="-l ${EXCLUDE_JOB_LABEL_SELECTOR}"
         fi
 
         kubectl --namespace="${namespace}" get "$type" $label_selector -o custom-columns=SPACE:.metadata.namespace,KIND:..kind,NAME:.metadata.name --no-headers | while read -r a b name; do
@@ -90,14 +100,27 @@ for namespace in $NAMESPACES; do
         'del(
             .metadata.annotations."control-plane.alpha.kubernetes.io/leader",
             .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
+            .metadata.managedFields,
             .metadata.creationTimestamp,
             .metadata.generation,
             .metadata.resourceVersion,
             .metadata.selfLink,
             .metadata.uid,
+            .metadata.ownerReferences[]?.uid,
             .spec.clusterIP,
             .status
-        )' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}/${name}.${type}.yaml"
+        )
+        | if .kind == "Job" then
+            # Job controller adds these server-side; removing them makes the backup stable and re-applicable.
+            del(
+              .metadata.labels."controller-uid",
+              .metadata.labels."batch.kubernetes.io/controller-uid",
+              .spec.selector,
+              .spec.template.metadata.labels."controller-uid",
+              .spec.template.metadata.labels."batch.kubernetes.io/controller-uid"
+            )
+          else . end
+        ' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}/${name}.${type}.yaml"
         done
     done
 done
