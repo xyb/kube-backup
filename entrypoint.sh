@@ -62,6 +62,7 @@ for resource in $GLOBALRESOURCES; do
     echo "Exporting resource: ${resource}" >/dev/stderr
     kubectl get -o=json "$resource" | jq --sort-keys \
         'del(
+          .items[].status,
           .items[].metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
           .items[].metadata.annotations."control-plane.alpha.kubernetes.io/leader",
           .items[].metadata.managedFields,
