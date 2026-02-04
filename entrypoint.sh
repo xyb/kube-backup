@@ -12,6 +12,20 @@ GLOBALRESOURCES="${GLOBALRESOURCES:-"namespace storageclass clusterrole clusterr
 # NOTE: "!=" also matches objects without that label key, which is usually what we want.
 EXCLUDE_JOB_LABEL_SELECTOR="${EXCLUDE_JOB_LABEL_SELECTOR:-app!=kube-backup}"
 
+# Optional: exclude Services by label selector (e.g. operator-generated services).
+# Example: 'app.kubernetes.io/created-by!=kuberay-operator'
+EXCLUDE_SVC_LABEL_SELECTOR="${EXCLUDE_SVC_LABEL_SELECTOR:-}"
+
+# Optional: exclude kube-ray head Services (high-churn, operator-generated).
+# This is content-based (looks at ownerReferences / spec.selector), not just metadata labels.
+EXCLUDE_RAY_HEAD_SERVICES="${EXCLUDE_RAY_HEAD_SERVICES:-false}"
+
+# Optional: strip `eks.amazonaws.com/termination` finalizer to reduce churn.
+# Selector forms:
+# - label:<k8s label selector> (server-side matching)
+# - annotation-prefix:<prefix> (client-side matching)
+FINALIZER_STRIP_SELECTOR="${FINALIZER_STRIP_SELECTOR:-}"
+
 # Initialize git repo
 [ -z "$DRY_RUN" ] && [ -z "$GIT_REPO" ] && echo "Need to define GIT_REPO environment variable" && exit 1
 GIT_REPO_PATH="${GIT_REPO_PATH:-"/backup/git"}"
@@ -60,8 +74,39 @@ fi
 for resource in $GLOBALRESOURCES; do
     [ -d "$GIT_REPO_PATH/$GIT_PREFIX_PATH" ] || mkdir -p "$GIT_REPO_PATH/$GIT_PREFIX_PATH"
     echo "Exporting resource: ${resource}" >/dev/stderr
+    f_mode=""
+    f_label_sel=""
+    f_ann_prefix=""
+    f_names_json="[]"
+    if [[ -n "$FINALIZER_STRIP_SELECTOR" ]]; then
+        if [[ "$FINALIZER_STRIP_SELECTOR" == label:* ]]; then
+            f_mode="label"
+            f_label_sel="${FINALIZER_STRIP_SELECTOR#label:}"
+            # If resource doesn't support label selectors, kubectl will error; ignore and treat as empty.
+            f_names_json="$(kubectl get "$resource" -l "$f_label_sel" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | jq -R -s -c 'split("\n")|map(select(length>0))' || echo '[]')"
+        elif [[ "$FINALIZER_STRIP_SELECTOR" == annotation-prefix:* ]]; then
+            f_mode="annotation-prefix"
+            f_ann_prefix="${FINALIZER_STRIP_SELECTOR#annotation-prefix:}"
+        fi
+    fi
+
     kubectl get -o=json "$resource" | jq --sort-keys \
-        'del(
+        --arg f_mode "$f_mode" \
+        --arg f_ann_prefix "$f_ann_prefix" \
+        --argjson f_names "$f_names_json" \
+        '
+        def should_strip_finalizer:
+          if $f_mode == "label" then ($f_names | index(.metadata.name)) != null
+          elif $f_mode == "annotation-prefix" then ((.metadata.annotations // {}) | keys | any(startswith($f_ann_prefix)))
+          else false end;
+
+        def strip_eks_termination_finalizer:
+          if should_strip_finalizer and (.metadata.finalizers? != null) then
+            (.metadata.finalizers |= map(select(. != "eks.amazonaws.com/termination")))
+            | if (.metadata.finalizers | length) == 0 then del(.metadata.finalizers) else . end
+          else . end;
+
+        del(
           .items[].status,
           .items[].metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
           .items[].metadata.annotations."control-plane.alpha.kubernetes.io/leader",
@@ -72,7 +117,10 @@ for resource in $GLOBALRESOURCES; do
           .items[].metadata.creationTimestamp,
           .items[].metadata.generation,
           .items[].metadata.ownerReferences[]?.uid
-      )' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml"
+        )
+        | (.items |= map(strip_eks_termination_finalizer))
+        | (.items |= sort_by(.metadata.name // ""))
+        ' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml"
 done
 
 for namespace in $NAMESPACES; do
@@ -88,6 +136,9 @@ for namespace in $NAMESPACES; do
         if [[ "$type" == 'job' && -n "${EXCLUDE_JOB_LABEL_SELECTOR:-}" ]]; then
             label_selector="-l ${EXCLUDE_JOB_LABEL_SELECTOR}"
         fi
+        if [[ "$type" == 'svc' && -n "${EXCLUDE_SVC_LABEL_SELECTOR:-}" ]]; then
+            label_selector="-l ${EXCLUDE_SVC_LABEL_SELECTOR}"
+        fi
 
         kubectl --namespace="${namespace}" get "$type" $label_selector -o custom-columns=SPACE:.metadata.namespace,KIND:..kind,NAME:.metadata.name --no-headers | while read -r a b name; do
             [ -z "$name" ] && continue
@@ -97,7 +148,43 @@ for namespace in $NAMESPACES; do
             continue
         fi
 
-        kubectl --namespace="${namespace}" get -o=json "$type" "$name" | jq --sort-keys \
+        obj_json="$(kubectl --namespace="${namespace}" get -o=json "$type" "$name")"
+
+        # Reduce noise: kube-ray head services are operator-generated and may appear/disappear frequently.
+        # Detect by:
+        # - created-by=kuberay-operator AND (ownerReferences.kind=RayCluster OR spec.selector indicates Ray head)
+        if [[ "$type" == 'svc' && "$EXCLUDE_RAY_HEAD_SERVICES" == "true" ]]; then
+            if echo "$obj_json" | jq -e '
+              (.metadata.labels["app.kubernetes.io/created-by"] == "kuberay-operator")
+              and (
+                any(.metadata.ownerReferences[]?; (.controller == true) and (.kind == "RayCluster"))
+                or (.spec.selector["ray.io/node-type"] == "head")
+                or (.spec.selector["ray.io/is-ray-node"] == "yes")
+              )
+            ' >/dev/null 2>&1; then
+                echo "[${namespace}] Skip svc (kuberay head): ${name}" >/dev/stderr
+                continue
+            fi
+        fi
+
+        f_mode=""
+        f_names_json="[]"
+        f_ann_prefix=""
+        if [[ -n "$FINALIZER_STRIP_SELECTOR" ]]; then
+            if [[ "$FINALIZER_STRIP_SELECTOR" == label:* ]]; then
+                f_mode="label"
+                f_label_sel="${FINALIZER_STRIP_SELECTOR#label:}"
+                f_names_json="$(kubectl --namespace="${namespace}" get "$type" -l "$f_label_sel" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | jq -R -s -c 'split("\n")|map(select(length>0))' || echo '[]')"
+            elif [[ "$FINALIZER_STRIP_SELECTOR" == annotation-prefix:* ]]; then
+                f_mode="annotation-prefix"
+                f_ann_prefix="${FINALIZER_STRIP_SELECTOR#annotation-prefix:}"
+            fi
+        fi
+
+        echo "$obj_json" | jq --sort-keys \
+        --arg f_mode "$f_mode" \
+        --arg f_ann_prefix "$f_ann_prefix" \
+        --argjson f_names "$f_names_json" \
         'del(
             .metadata.annotations."control-plane.alpha.kubernetes.io/leader",
             .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
@@ -111,6 +198,16 @@ for namespace in $NAMESPACES; do
             .spec.clusterIP,
             .status
         )
+        | def should_strip_finalizer:
+            if $f_mode == "label" then ($f_names | index(.metadata.name)) != null
+            elif $f_mode == "annotation-prefix" then ((.metadata.annotations // {}) | keys | any(startswith($f_ann_prefix)))
+            else false end;
+          def strip_eks_termination_finalizer:
+            if should_strip_finalizer and (.metadata.finalizers? != null) then
+              (.metadata.finalizers |= map(select(. != "eks.amazonaws.com/termination")))
+              | if (.metadata.finalizers | length) == 0 then del(.metadata.finalizers) else . end
+            else . end;
+          strip_eks_termination_finalizer
         | if .kind == "Job" then
             # Job controller adds these server-side; removing them makes the backup stable and re-applicable.
             del(
