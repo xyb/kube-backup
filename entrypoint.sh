@@ -12,6 +12,14 @@ GLOBALRESOURCES="${GLOBALRESOURCES:-"namespace storageclass clusterrole clusterr
 # NOTE: "!=" also matches objects without that label key, which is usually what we want.
 EXCLUDE_JOB_LABEL_SELECTOR="${EXCLUDE_JOB_LABEL_SELECTOR:-app!=kube-backup}"
 
+# Optional: exclude Services by label selector (e.g. operator-generated services).
+# Example: 'app.kubernetes.io/created-by!=kuberay-operator'
+EXCLUDE_SVC_LABEL_SELECTOR="${EXCLUDE_SVC_LABEL_SELECTOR:-}"
+
+# Optional: exclude kube-ray head Services (high-churn, operator-generated).
+# This is content-based (looks at ownerReferences / spec.selector), not just metadata labels.
+EXCLUDE_RAY_HEAD_SERVICES="${EXCLUDE_RAY_HEAD_SERVICES:-false}"
+
 # Initialize git repo
 [ -z "$DRY_RUN" ] && [ -z "$GIT_REPO" ] && echo "Need to define GIT_REPO environment variable" && exit 1
 GIT_REPO_PATH="${GIT_REPO_PATH:-"/backup/git"}"
@@ -72,7 +80,9 @@ for resource in $GLOBALRESOURCES; do
           .items[].metadata.creationTimestamp,
           .items[].metadata.generation,
           .items[].metadata.ownerReferences[]?.uid
-      )' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml"
+      )
+      | if (.items? != null) then (.items |= sort_by(.metadata.name // "")) else . end
+      ' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml"
 done
 
 for namespace in $NAMESPACES; do
@@ -88,6 +98,9 @@ for namespace in $NAMESPACES; do
         if [[ "$type" == 'job' && -n "${EXCLUDE_JOB_LABEL_SELECTOR:-}" ]]; then
             label_selector="-l ${EXCLUDE_JOB_LABEL_SELECTOR}"
         fi
+        if [[ "$type" == 'svc' && -n "${EXCLUDE_SVC_LABEL_SELECTOR:-}" ]]; then
+            label_selector="-l ${EXCLUDE_SVC_LABEL_SELECTOR}"
+        fi
 
         kubectl --namespace="${namespace}" get "$type" $label_selector -o custom-columns=SPACE:.metadata.namespace,KIND:..kind,NAME:.metadata.name --no-headers | while read -r a b name; do
             [ -z "$name" ] && continue
@@ -97,7 +110,26 @@ for namespace in $NAMESPACES; do
             continue
         fi
 
-        kubectl --namespace="${namespace}" get -o=json "$type" "$name" | jq --sort-keys \
+        obj_json="$(kubectl --namespace="${namespace}" get -o=json "$type" "$name")"
+
+        # Reduce noise: kube-ray head services are operator-generated and may appear/disappear frequently.
+        # Detect by:
+        # - created-by=kuberay-operator AND (ownerReferences.kind=RayCluster OR spec.selector indicates Ray head)
+        if [[ "$type" == 'svc' && "$EXCLUDE_RAY_HEAD_SERVICES" == "true" ]]; then
+            if echo "$obj_json" | jq -e '
+              (.metadata.labels["app.kubernetes.io/created-by"] == "kuberay-operator")
+              and (
+                any(.metadata.ownerReferences[]?; (.controller == true) and (.kind == "RayCluster"))
+                or (.spec.selector["ray.io/node-type"] == "head")
+                or (.spec.selector["ray.io/is-ray-node"] == "yes")
+              )
+            ' >/dev/null 2>&1; then
+                echo "[${namespace}] Skip svc (kuberay head): ${name}" >/dev/stderr
+                continue
+            fi
+        fi
+
+        echo "$obj_json" | jq --sort-keys \
         'del(
             .metadata.annotations."control-plane.alpha.kubernetes.io/leader",
             .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
